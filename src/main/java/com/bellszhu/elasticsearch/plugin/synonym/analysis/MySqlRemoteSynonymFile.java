@@ -1,5 +1,6 @@
 package com.bellszhu.elasticsearch.plugin.synonym.analysis;
 
+import com.alibaba.druid.pool.DruidDataSource;
 import com.bellszhu.elasticsearch.plugin.DynamicSynonymPlugin;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -52,19 +53,46 @@ public class MySqlRemoteSynonymFile implements SynonymFile{
     private static final String jdbcUser = "jdbc.user";
     // 数据库密码
     private static final String jdbcPassword = "jdbc.password";
+    private static final String jdbcDriver = "jdbc.driver";
 
     /**
      * 当前节点的同义词版本号
      */
     private long lastModified;
 
-    private Connection connection = null;
-
-    private Statement statement = null;
-
-    private Properties props;
+    private static Properties props;
 
     private Path conf_dir;
+
+    private static DruidDataSource dataSource;
+    private static final int maxActive = 10;
+    private static final int initialSize = 1;
+    private static final int maxWait = 6000;
+    private static final int minIdle = 2;
+
+    static {
+        dataSource= new DruidDataSource();
+        dataSource.setUrl(getUrl());
+        dataSource.setDriverClassName(getDriver());
+        dataSource.setUsername(getUsername());
+        dataSource.setPassword(getPassword());
+        dataSource.setMaxActive(maxActive);
+        dataSource.setInitialSize(initialSize);
+        dataSource.setMaxWait(maxWait);
+        dataSource.setMinIdle(minIdle);
+        dataSource.setConnectionErrorRetryAttempts(5);
+        dataSource.setBreakAfterAcquireFailure(true);
+    }
+
+    public static String getUrl() {
+        return  ReloadProperty.getSingleton().getProperty(jdbcUrl); }
+    public static String getUsername() {
+        return  ReloadProperty.getSingleton().getProperty(jdbcUser);
+    }
+    public static String getPassword() {
+        return  ReloadProperty.getSingleton().getProperty(jdbcPassword);
+    }
+    public static String getDriver() { return ReloadProperty.getSingleton().getProperty(jdbcDriver); }
 
     MySqlRemoteSynonymFile(Environment env, Analyzer analyzer,
                            boolean expand, boolean lenient, String format, String location) {
@@ -75,6 +103,8 @@ public class MySqlRemoteSynonymFile implements SynonymFile{
         this.env = env;
         this.location = location;
         this.props = new Properties();
+
+        logger.info("------ MySqlRemoteSynonymFile struct load start -------");
 
         //读取当前 jar 包存放的路径
         Path filePath = PathUtils.get(new File(DynamicSynonymPlugin.class.getProtectionDomain().getCodeSource()
@@ -126,6 +156,8 @@ public class MySqlRemoteSynonymFile implements SynonymFile{
     @Override
     public boolean isNeedReloadSynonymMap() {
         try {
+            logger.info("------ isNeedReloadSynonymMap! -------");
+
             Long lastModify = getLastModify();
             if (Objects.isNull(lastModified) || (lastModified < lastModify)) {
                 lastModified = lastModify;
@@ -145,60 +177,73 @@ public class MySqlRemoteSynonymFile implements SynonymFile{
      * @return getLastModify
      */
     public Long getLastModify() {
-        ResultSet resultSet = null;
         Long last_modify_long = null;
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
         try {
-            if (connection == null || statement == null) {
-                statement = getConnection(props, connection);
-            }
-            resultSet = statement.executeQuery(props.getProperty("jdbc.lastModified.synonym.sql"));
-            while (resultSet.next()) {
-                Timestamp last_modify_dt = resultSet.getTimestamp("last_modify_dt");
+            conn = dataSource.getConnection();
+            String sql = props.getProperty("jdbc.lastModified.synonym.sql");
+            ps = conn.prepareStatement(sql);
+            rs = ps.executeQuery();
+            while (rs.next()) {
+                Timestamp last_modify_dt = rs.getTimestamp("last_modify_dt");
                 logger.info("获取同义词库最后一次修改的时间，last_modify_dt:{}",last_modify_dt);
                 last_modify_long = last_modify_dt.getTime();
             }
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
-            try {
-                if (resultSet != null) {
-                    resultSet.close();
-                }
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-
+            closeRsAndPs(rs, ps,conn);
         }
         return last_modify_long;
     }
 
     public ArrayList<String> getDBData() {
         ArrayList<String> arrayList = new ArrayList<>();
-        ResultSet resultSet = null;
+        Connection conn = null;
+        PreparedStatement ps = null;
+        ResultSet rs = null;
         try {
-
-            if (connection == null || statement == null) {
-                statement = getConnection(props, connection);
-            }
-            logger.info("正在执行SQL查询同义词列表，SQL:{}", props.getProperty("jdbc.reload.synonym.sql"));
-            resultSet = statement.executeQuery(props.getProperty("jdbc.reload.synonym.sql"));
-            while (resultSet.next()) {
-                String theWord = resultSet.getString("word");
+            conn = dataSource.getConnection();
+            String sql = props.getProperty("jdbc.reload.synonym.sql");
+            logger.info("正在执行SQL查询同义词列表，SQL:{}", sql);
+            ps = conn.prepareStatement(sql);
+            rs = ps.executeQuery();
+            while (rs.next()) {
+                String theWord = rs.getString("word");
                 arrayList.add(theWord);
             }
         } catch (Exception e) {
             logger.error(e);
         } finally {
-            try {
-                if (resultSet != null) {
-                    resultSet.close();
-                }
-            } catch (SQLException e) {
-                e.printStackTrace();
-            }
-
+            closeRsAndPs(rs, ps,conn);
         }
         return arrayList;
+    }
+
+    public void closeRsAndPs(ResultSet rs, PreparedStatement ps,Connection conn) {
+        if (rs != null) {
+            try {
+                rs.close();
+            } catch (SQLException e) {
+                logger.error("failed to close ResultSet", e);
+            }
+        }
+        if (ps != null) {
+            try {
+                ps.close();
+            } catch (SQLException e) {
+                logger.error("failed to close PreparedStatement", e);
+            }
+        }
+        if (conn != null) {
+            try {
+                conn.close();
+            } catch (SQLException e) {
+                logger.error("failed to close Connection", e);
+            }
+        }
     }
 
     /**
@@ -224,18 +269,4 @@ public class MySqlRemoteSynonymFile implements SynonymFile{
         return new StringReader(sb.toString());
     }
 
-    /**
-     * 获取数据库可执行连接
-     * @param props
-     * @param conn
-     * @throws SQLException
-     */
-    private static Statement getConnection(Properties props, Connection conn) throws SQLException, ClassNotFoundException {
-        Class.forName(props.getProperty("jdbc.driver"));
-        conn = DriverManager.getConnection(
-                props.getProperty(jdbcUrl),
-                props.getProperty(jdbcUser),
-                props.getProperty(jdbcPassword));
-        return conn.createStatement();
-    }
 }

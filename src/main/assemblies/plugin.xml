@@ -37,6 +37,8 @@
                 <include>org.apache.httpcomponents:httpclient</include>
                 <!--这里 看我看我-->
                 <include>mysql:mysql-connector-java</include>
+                <include>com.alibaba:druid</include>
+                <include>org.springframework:spring-context</include>
             </includes>
         </dependencySet>
     </dependencySets>
